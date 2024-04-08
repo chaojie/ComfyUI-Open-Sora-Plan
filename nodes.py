@@ -48,12 +48,13 @@ class OpenSoraPlanLoader:
     CATEGORY = "OpenSoraPlan"
 
     def run(self,model_path,ae,text_encoder_name,version,force_images):
-        device = torch.device('cuda:0')
+        cuda_device = torch.device('cuda:0')
+        cpu_device = torch.device('cpu')
 
         # Load model:
-        transformer_model = LatteT2V.from_pretrained(model_path, subfolder=version, torch_dtype=torch.float16, cache_dir='cache_dir').to(device)
+        transformer_model = LatteT2V.from_pretrained(model_path, subfolder=version, torch_dtype=torch.float16, cache_dir='cache_dir').to(cuda_device)
 
-        vae = getae_wrapper(ae)(model_path, subfolder="vae", cache_dir='cache_dir').to(device, dtype=torch.float16)
+        vae = getae_wrapper(ae)(model_path, subfolder="vae", cache_dir='cache_dir').to(cpu_device, dtype=torch.float16)
         vae.vae.enable_tiling()
         image_size = int(version.split('x')[1])
         latent_size = (image_size // ae_stride_config[ae][1], image_size // ae_stride_config[ae][2])
@@ -61,7 +62,7 @@ class OpenSoraPlanLoader:
         transformer_model.force_images = force_images
         tokenizer = T5Tokenizer.from_pretrained(text_encoder_name, cache_dir="cache_dir")
         text_encoder = T5EncoderModel.from_pretrained(text_encoder_name, cache_dir="cache_dir",
-                                                    torch_dtype=torch.float16).to(device)
+                                                    torch_dtype=torch.float16).to(cuda_device)
 
         # set eval mode
         transformer_model.eval()
@@ -72,7 +73,7 @@ class OpenSoraPlanLoader:
                                             text_encoder=text_encoder,
                                             tokenizer=tokenizer,
                                             scheduler=scheduler,
-                                            transformer=transformer_model).to(device=device)
+                                            transformer=transformer_model).to(device=cuda_device)
         return ((videogen_pipeline,transformer_model,version),)
 
 class OpenSoraPlanRun:
@@ -95,6 +96,12 @@ class OpenSoraPlanRun:
 
     def run(self,model,prompt,num_inference_steps,guidance_scale,seed,force_images):
         videogen_pipeline,transformer_model,version=model
+        cuda_device = torch.device('cuda:0')
+        cpu_device = torch.device('cpu')
+        videogen_pipeline.vae.to(device=cuda_device)
+        videogen_pipeline.text_encoder.to(device=cuda_device)
+        videogen_pipeline.transformer.to(device=cuda_device)
+        videogen_pipeline.to(device=cuda_device)
         #seed = int(randomize_seed_fn(seed, randomize_seed))
         set_env(seed)
         video_length = transformer_model.config.video_length if not force_images else 1
@@ -111,6 +118,10 @@ class OpenSoraPlanRun:
                                 mask_feature=True,
                                 ).video
 
+        videogen_pipeline.vae.to(device=cpu_device)
+        videogen_pipeline.to(device=cpu_device)
+        videogen_pipeline.text_encoder.to(device=cpu_device)
+        videogen_pipeline.transformer.to(device=cpu_device)
         torch.cuda.empty_cache()
         print(f'{videos.shape}')
         #videos = videos[0]
@@ -119,7 +130,90 @@ class OpenSoraPlanRun:
         #display_model_info = f"Video size: {num_frames}×{height}×{width}, \nSampling Step: {sample_steps}, \nGuidance Scale: {scale}"
         return videos/255.0
 
+class OpenSoraPlanSample:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "model":("OpenSoraPlanModel",),
+                "prompt":("STRING",{"default":""}),
+                "num_inference_steps":("INT",{"default":50}),
+                "guidance_scale":("FLOAT",{"default":10.0}),
+                "seed":("INT",{"default":1234}),
+                "force_images":("BOOLEAN",{"default":False}),
+            },
+        }
+
+    RETURN_TYPES = ("LATENT",)
+    FUNCTION = "run"
+    CATEGORY = "StreamingT2V"
+
+    def run(self,model,prompt,num_inference_steps,guidance_scale,seed,force_images):
+        videogen_pipeline,transformer_model,version=model
+        cuda_device = torch.device('cuda:0')
+        cpu_device = torch.device('cpu')
+        videogen_pipeline.text_encoder.to(device=cuda_device)
+        videogen_pipeline.transformer.to(device=cuda_device)
+        videogen_pipeline.to(device=cuda_device)
+        videogen_pipeline.vae.to(device=cpu_device)
+        #seed = int(randomize_seed_fn(seed, randomize_seed))
+        set_env(seed)
+        video_length = transformer_model.config.video_length if not force_images else 1
+        height, width = int(version.split('x')[1]), int(version.split('x')[2])
+        num_frames = 1 if video_length == 1 else int(version.split('x')[0])
+        videos = videogen_pipeline(prompt,
+                                video_length=video_length,
+                                height=height,
+                                width=width,
+                                num_inference_steps=num_inference_steps,
+                                guidance_scale=guidance_scale,
+                                enable_temporal_attentions=not force_images,
+                                num_images_per_prompt=1,
+                                mask_feature=True,
+                                output_type="latents",
+                                ).video
+        videogen_pipeline.to(device=cpu_device)
+        videogen_pipeline.text_encoder.to(device=cpu_device)
+        videogen_pipeline.transformer.to(device=cpu_device)
+        torch.cuda.empty_cache()
+
+        return ({"samples":videos},)
+
+class OpenSoraPlanDecode:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "model":("OpenSoraPlanModel",),
+                "samples": ("LATENT",),
+            },
+        }
+
+    RETURN_TYPES = ("IMAGE",)
+    RETURN_NAMES = ("image",)
+    FUNCTION = "run"
+    CATEGORY = "PixArt"
+
+    def run(self,model,samples):
+        videogen_pipeline,transformer_model,version=model
+        cuda_device = torch.device('cuda:0')
+        cpu_device = torch.device('cpu')
+        videogen_pipeline.vae.to(device=cuda_device)
+        latents=samples["samples"]
+
+        with torch.no_grad():
+            video = videogen_pipeline.vae.decode(latents)
+            video = ((video / 2.0 + 0.5).clamp(0, 1) * 255).to(dtype=torch.uint8).cpu().permute(0, 1, 3, 4, 2).contiguous()
+            video = video/250.0
+
+        videogen_pipeline.vae.to(device=cpu_device)
+        torch.cuda.empty_cache()
+
+        return video
+
 NODE_CLASS_MAPPINGS = {
     "OpenSoraPlanLoader":OpenSoraPlanLoader,
     "OpenSoraPlanRun":OpenSoraPlanRun,
+    "OpenSoraPlanSample":OpenSoraPlanSample,
+    "OpenSoraPlanDecode":OpenSoraPlanDecode,
 }

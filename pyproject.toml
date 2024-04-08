@@ -1,0 +1,47 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "opensora"
+version = "1.0.0"
+description = "Reproduce OpenAI's Sora."
+readme = "README.md"
+requires-python = ">=3.8"
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: Apache Software License",
+]
+dependencies = [
+    "albumentations", "av", "decord", "einops",
+    "gdown", "h5py", "idna", 'imageio', "matplotlib",
+    "omegaconf", "opencv-python", "opencv-python-headless", "pandas", "pillow",
+    "pydub", "pytorch-lightning", "pytorchvideo", "PyYAML", "regex",
+    "requests", "scikit-learn", "scipy", "six", "test-tube",
+    "timm", "torchdiffeq", "torchmetrics", "tqdm", "urllib3", "uvicorn",
+    "diffusers", "scikit-video", "imageio-ffmpeg", "sentencepiece", "beautifulsoup4",
+    "ftfy", "moviepy", "wandb", "tensorboard"
+]
+
+[project.optional-dependencies]
+train = ["deepspeed==0.9.5", "pydantic==1.10.13"]
+dev = ["mypy==1.8.0"]
+
+
+[project.urls]
+"Homepage" = "https://github.com/PKU-YuanGroup/Open-Sora-Plan"
+"Bug Tracker" = "https://github.com/PKU-YuanGroup/Open-Sora-Plan/issues"
+
+[tool.setuptools.packages.find]
+exclude = ["assets*", "docker*", "docs", "scripts*"]
+
+[tool.wheel]
+exclude = ["assets*", "docker*", "docs", "scripts*"]
+
+[tool.mypy]
+warn_return_any = true
+warn_unused_configs = true
+ignore_missing_imports = true
+disallow_untyped_calls = true
+check_untyped_defs = true
+no_implicit_optional = true

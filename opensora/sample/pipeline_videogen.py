@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-
+import math
 import html
 import inspect
 import re
@@ -501,15 +501,15 @@ class VideoGenPipeline(DiffusionPipeline):
         return caption.strip()
 
     # Copied from diffusers.pipelines.stable_diffusion.pipeline_stable_diffusion.StableDiffusionPipeline.prepare_latents
-    def prepare_latents(self, batch_size, num_channels_latents, video_length, height, width, dtype, device, generator,
+    def prepare_latents(self, batch_size, num_channels_latents, num_frames, height, width, dtype, device, generator,
                         latents=None):
         shape = (
-        batch_size, num_channels_latents, video_length, self.vae.latent_size[0], self.vae.latent_size[1])
-        if isinstance(generator, list) and len(generator) != batch_size:
-            raise ValueError(
-                f"You have passed a list of generators of length {len(generator)}, but requested an effective batch"
-                f" size of {batch_size}. Make sure the batch size matches the length of the generators."
-            )
+            batch_size,
+            num_channels_latents,
+            (math.ceil((int(num_frames) - 1) / self.vae.vae_scale_factor[0]) + 1) if int(num_frames) % 2 == 1 else math.ceil(int(num_frames) / self.vae.vae_scale_factor[0]), 
+            math.ceil(int(height) / self.vae.vae_scale_factor[1]),
+            math.ceil(int(width) / self.vae.vae_scale_factor[2]),
+        )
 
         if latents is None:
             latents = randn_tensor(shape, generator=generator, device=device, dtype=dtype)
@@ -530,7 +530,7 @@ class VideoGenPipeline(DiffusionPipeline):
             timesteps: List[int] = None,
             guidance_scale: float = 4.5,
             num_images_per_prompt: Optional[int] = 1,
-            video_length: Optional[int] = None,
+            num_frames: Optional[int] = None,
             height: Optional[int] = None,
             width: Optional[int] = None,
             eta: float = 0.0,
@@ -661,7 +661,7 @@ class VideoGenPipeline(DiffusionPipeline):
         latents = self.prepare_latents(
             batch_size * num_images_per_prompt,
             latent_channels,
-            video_length,
+            num_frames,
             height,
             width,
             prompt_embeds.dtype,
@@ -684,8 +684,6 @@ class VideoGenPipeline(DiffusionPipeline):
 
         # 7. Denoising loop
         num_warmup_steps = max(len(timesteps) - num_inference_steps * self.scheduler.order, 0)
-        import comfy.utils
-        pbar = comfy.utils.ProgressBar(num_inference_steps)
 
         with self.progress_bar(total=num_inference_steps) as progress_bar:
             for i, t in enumerate(timesteps):
@@ -707,6 +705,10 @@ class VideoGenPipeline(DiffusionPipeline):
                 # broadcast to batch dimension in a way that's compatible with ONNX/Core ML
                 current_timestep = current_timestep.expand(latent_model_input.shape[0])
 
+                if prompt_embeds.ndim == 3:
+                    prompt_embeds = prompt_embeds.unsqueeze(1)  # b l d -> b 1 l d
+                # if prompt_attention_mask.ndim == 2:
+                #     prompt_attention_mask = prompt_attention_mask.unsqueeze(1)  # b l -> b 1 l
                 # predict noise model_output
                 noise_pred = self.transformer(
                     latent_model_input,
@@ -734,13 +736,13 @@ class VideoGenPipeline(DiffusionPipeline):
                 # call the callback, if provided
                 if i == len(timesteps) - 1 or ((i + 1) > num_warmup_steps and (i + 1) % self.scheduler.order == 0):
                     progress_bar.update()
-                    pbar.update(1)
                     if callback is not None and i % callback_steps == 0:
                         step_idx = i // getattr(self.scheduler, "order", 1)
                         callback(step_idx, t, latents)
 
         if not output_type == 'latents':
             video = self.decode_latents(latents)
+            video = video[:, :num_frames, :height, :width]
         else:
             video = latents
             return VideoPipelineOutput(video=video)
@@ -754,9 +756,7 @@ class VideoGenPipeline(DiffusionPipeline):
         return VideoPipelineOutput(video=video)
 
     def decode_latents(self, latents):
-        video = self.vae.decode(latents)
-        # video = self.vae.decode(latents / 0.18215)
-        # video = rearrange(video, 'b c t h w -> b t c h w').contiguous()
+        video = self.vae.decode(latents) # b t c h w
+        # b t c h w -> b t h w c
         video = ((video / 2.0 + 0.5).clamp(0, 1) * 255).to(dtype=torch.uint8).cpu().permute(0, 1, 3, 4, 2).contiguous()
-        # we always cast to float32 as this does not cause significant overhead and is compatible with bfloa16
         return video

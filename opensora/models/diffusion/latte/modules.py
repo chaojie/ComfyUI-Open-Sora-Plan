@@ -1,28 +1,15 @@
 from importlib import import_module
 
 import numpy as np
-import torch
-
-import os
-import json
-
-from dataclasses import dataclass
-from einops import rearrange, repeat
 from typing import Any, Dict, Optional, Tuple, Callable
-from diffusers.models import Transformer2DModel
 from diffusers.utils import USE_PEFT_BACKEND, BaseOutput, deprecate, is_xformers_available
-from diffusers.models.embeddings import get_1d_sincos_pos_embed_from_grid, ImagePositionalEmbeddings, PixArtAlphaTextProjection, \
-    PatchEmbed, PixArtAlphaCombinedTimestepSizeEmbeddings 
-from diffusers.configuration_utils import ConfigMixin, register_to_config
-from diffusers.models.modeling_utils import ModelMixin
-from diffusers.models.attention import BasicTransformerBlock
 from diffusers.models.lora import LoRACompatibleConv, LoRACompatibleLinear
 
 import torch
 import torch.nn.functional as F
 from torch import nn
 from diffusers.utils.torch_utils import maybe_allow_in_graph
-from diffusers.models.embeddings import SinusoidalPositionalEmbedding
+from diffusers.models.embeddings import SinusoidalPositionalEmbedding, TimestepEmbedding, Timesteps
 from diffusers.models.normalization import AdaLayerNorm, AdaLayerNormZero
 from diffusers.models.attention_processor import SpatialNorm, LORA_ATTENTION_PROCESSORS, \
     CustomDiffusionAttnProcessor, CustomDiffusionXFormersAttnProcessor, CustomDiffusionAttnProcessor2_0, \
@@ -33,9 +20,7 @@ from diffusers.models.activations import GEGLU, GELU, ApproximateGELU
 
 from dataclasses import dataclass
 
-from torch import nn
-
-from opensora.models.diffusion.utils.pos_embed import get_2d_sincos_pos_embed
+from opensora.models.diffusion.utils.pos_embed import get_2d_sincos_pos_embed, RoPE1D, RoPE2D, LinearScalingRoPE2D, LinearScalingRoPE1D
 
 if is_xformers_available():
     import xformers
@@ -43,6 +28,80 @@ if is_xformers_available():
 else:
     xformers = None
 
+
+class CombinedTimestepSizeEmbeddings(nn.Module):
+    """
+    For PixArt-Alpha.
+
+    Reference:
+    https://github.com/PixArt-alpha/PixArt-alpha/blob/0f55e922376d8b797edd44d25d0e7464b260dcab/diffusion/model/nets/PixArtMS.py#L164C9-L168C29
+    """
+
+    def __init__(self, embedding_dim, size_emb_dim, use_additional_conditions: bool = False):
+        super().__init__()
+
+        self.outdim = size_emb_dim
+        self.time_proj = Timesteps(num_channels=256, flip_sin_to_cos=True, downscale_freq_shift=0)
+        self.timestep_embedder = TimestepEmbedding(in_channels=256, time_embed_dim=embedding_dim)
+
+        self.use_additional_conditions = use_additional_conditions
+        if use_additional_conditions:
+            self.use_additional_conditions = True
+            self.additional_condition_proj = Timesteps(num_channels=256, flip_sin_to_cos=True, downscale_freq_shift=0)
+            self.resolution_embedder = TimestepEmbedding(in_channels=256, time_embed_dim=size_emb_dim)
+            self.aspect_ratio_embedder = TimestepEmbedding(in_channels=256, time_embed_dim=size_emb_dim)
+
+    def apply_condition(self, size: torch.Tensor, batch_size: int, embedder: nn.Module):
+        if size.ndim == 1:
+            size = size[:, None]
+
+        if size.shape[0] != batch_size:
+            size = size.repeat(batch_size // size.shape[0], 1)
+            if size.shape[0] != batch_size:
+                raise ValueError(f"`batch_size` should be {size.shape[0]} but found {batch_size}.")
+
+        current_batch_size, dims = size.shape[0], size.shape[1]
+        size = size.reshape(-1)
+        size_freq = self.additional_condition_proj(size).to(size.dtype)
+
+        size_emb = embedder(size_freq)
+        size_emb = size_emb.reshape(current_batch_size, dims * self.outdim)
+        return size_emb
+
+    def forward(self, timestep, resolution, aspect_ratio, batch_size, hidden_dtype):
+        timesteps_proj = self.time_proj(timestep)
+        timesteps_emb = self.timestep_embedder(timesteps_proj.to(dtype=hidden_dtype))  # (N, D)
+
+        if self.use_additional_conditions:
+            resolution = self.apply_condition(resolution, batch_size=batch_size, embedder=self.resolution_embedder)
+            aspect_ratio = self.apply_condition(
+                aspect_ratio, batch_size=batch_size, embedder=self.aspect_ratio_embedder
+            )
+            conditioning = timesteps_emb + torch.cat([resolution, aspect_ratio], dim=1)
+        else:
+            conditioning = timesteps_emb
+
+        return conditioning
+
+class CaptionProjection(nn.Module):
+    """
+    Projects caption embeddings. Also handles dropout for classifier-free guidance.
+
+    Adapted from https://github.com/PixArt-alpha/PixArt-alpha/blob/master/diffusion/model/nets/PixArt_blocks.py
+    """
+
+    def __init__(self, in_features, hidden_size, num_tokens=120):
+        super().__init__()
+        self.linear_1 = nn.Linear(in_features=in_features, out_features=hidden_size, bias=True)
+        self.act_1 = nn.GELU(approximate="tanh")
+        self.linear_2 = nn.Linear(in_features=hidden_size, out_features=hidden_size, bias=True)
+        self.register_buffer("y_embedding", nn.Parameter(torch.randn(num_tokens, in_features) / in_features**0.5))
+
+    def forward(self, caption, force_drop_ids=None):
+        hidden_states = self.linear_1(caption)
+        hidden_states = self.act_1(hidden_states)
+        hidden_states = self.linear_2(hidden_states)
+        return hidden_states
 
 class PatchEmbed(nn.Module):
     """2D Image to Patch Embedding"""
@@ -77,6 +136,7 @@ class PatchEmbed(nn.Module):
         # See:
         # https://github.com/PixArt-alpha/PixArt-alpha/blob/0f55e922376d8b797edd44d25d0e7464b260dcab/diffusion/model/nets/PixArtMS.py#L161
         self.height, self.width = height // patch_size, width // patch_size
+
         self.base_size = height // patch_size
         self.interpolation_scale = interpolation_scale
         pos_embed = get_2d_sincos_pos_embed(
@@ -92,10 +152,10 @@ class PatchEmbed(nn.Module):
             latent = latent.flatten(2).transpose(1, 2)  # BCHW -> BNC
         if self.layer_norm:
             latent = self.norm(latent)
-
         # Interpolate positional embeddings if needed.
         # (For PixArt-Alpha: https://github.com/PixArt-alpha/PixArt-alpha/blob/0f55e922376d8b797edd44d25d0e7464b260dcab/diffusion/model/nets/PixArtMS.py#L162C151-L162C160)
         if self.height != height or self.width != width:
+            # raise ValueError
             pos_embed = get_2d_sincos_pos_embed(
                 embed_dim=self.pos_embed.shape[-1],
                 grid_size=(height, width),
@@ -106,7 +166,6 @@ class PatchEmbed(nn.Module):
             pos_embed = pos_embed.float().unsqueeze(0).to(latent.device)
         else:
             pos_embed = self.pos_embed
-
         return (latent + pos_embed).to(latent.dtype)
 
 
@@ -186,6 +245,9 @@ class Attention(nn.Module):
         _from_deprecated_attn_block: bool = False,
         processor: Optional["AttnProcessor"] = None,
         attention_mode: str = 'xformers',
+        use_rope: bool = False,
+        rope_scaling: Optional[Dict] = None, 
+        compress_kv_factor: Optional[Tuple] = None, 
     ):
         super().__init__()
         self.inner_dim = dim_head * heads
@@ -195,6 +257,9 @@ class Attention(nn.Module):
         self.rescale_output_factor = rescale_output_factor
         self.residual_connection = residual_connection
         self.dropout = dropout
+        self.use_rope = use_rope
+        self.rope_scaling = rope_scaling
+        self.compress_kv_factor = compress_kv_factor
 
         # we make use of this private variable to know whether this class is loaded
         # with an deprecated state dict so that we can convert it on the fly
@@ -255,6 +320,10 @@ class Attention(nn.Module):
         else:
             linear_cls = LoRACompatibleLinear
 
+        assert not (self.use_rope and (self.compress_kv_factor is not None)), "Can not both enable compressing kv and using rope"
+        if self.compress_kv_factor is not None:
+            self._init_compress()
+
         self.to_q = linear_cls(query_dim, self.inner_dim, bias=bias)
 
         if not self.only_cross_attention:
@@ -279,7 +348,7 @@ class Attention(nn.Module):
         # but only if it has the default `scale` argument. TODO remove scale_qk check when we move to torch 2.1
         if processor is None:
             processor = (
-                AttnProcessor2_0(attention_mode) if hasattr(F, "scaled_dot_product_attention") and self.scale_qk else AttnProcessor()
+                AttnProcessor2_0(self.inner_dim, attention_mode, use_rope, rope_scaling=rope_scaling, compress_kv_factor=compress_kv_factor) if hasattr(F, "scaled_dot_product_attention") and self.scale_qk else AttnProcessor()
             )
         self.set_processor(processor)
 
@@ -767,16 +836,49 @@ class Attention(nn.Module):
 
         return encoder_hidden_states
 
+    def _init_compress(self):
+        if len(self.compress_kv_factor) == 2:
+            self.sr = nn.Conv2d(self.inner_dim, self.inner_dim, groups=self.inner_dim, kernel_size=self.compress_kv_factor, stride=self.compress_kv_factor)
+            self.sr.weight.data.fill_(1/self.compress_kv_factor[0]**2)
+        elif len(self.compress_kv_factor) == 1:
+            self.kernel_size = self.compress_kv_factor[0]
+            self.sr = nn.Conv1d(self.inner_dim, self.inner_dim, groups=self.inner_dim, kernel_size=self.compress_kv_factor[0], stride=self.compress_kv_factor[0])
+            self.sr.weight.data.fill_(1/self.compress_kv_factor[0])
+        self.sr.bias.data.zero_()
+        self.norm = nn.LayerNorm(self.inner_dim)
+
 class AttnProcessor2_0:
     r"""
     Processor for implementing scaled dot-product attention (enabled by default if you're using PyTorch 2.0).
     """
 
-    def __init__(self, attention_mode='xformers'):
+    def __init__(self, dim=1152, attention_mode='xformers', use_rope=False, rope_scaling=None, compress_kv_factor=None):
+        self.dim = dim
         self.attention_mode = attention_mode
+        self.use_rope = use_rope
+        self.rope_scaling = rope_scaling
+        self.compress_kv_factor = compress_kv_factor
+        if self.use_rope:
+            self._init_rope()
+
         if not hasattr(F, "scaled_dot_product_attention"):
             raise ImportError("AttnProcessor2_0 requires PyTorch 2.0, to use it, please upgrade PyTorch to 2.0.")
+        
 
+    def _init_rope(self):
+        if self.rope_scaling is None:
+            self.rope2d = RoPE2D()
+            self.rope1d = RoPE1D()
+        else:
+            scaling_type = self.rope_scaling["type"]
+            scaling_factor_2d = self.rope_scaling["factor_2d"]
+            scaling_factor_1d = self.rope_scaling["factor_1d"]
+            if scaling_type == "linear":
+                self.rope2d = LinearScalingRoPE2D(scaling_factor=scaling_factor_2d)
+                self.rope1d = LinearScalingRoPE1D(scaling_factor=scaling_factor_1d)
+            else:
+                raise ValueError(f"Unknown RoPE scaling type {scaling_type}")
+            
     def __call__(
         self,
         attn: Attention,
@@ -785,6 +887,9 @@ class AttnProcessor2_0:
         attention_mask: Optional[torch.FloatTensor] = None,
         temb: Optional[torch.FloatTensor] = None,
         scale: float = 1.0,
+        position_q: Optional[torch.LongTensor] = None,
+        position_k: Optional[torch.LongTensor] = None,
+        last_shape: Tuple[int] = None, 
     ) -> torch.FloatTensor:
         residual = hidden_states
 
@@ -798,6 +903,24 @@ class AttnProcessor2_0:
         if input_ndim == 4:
             batch_size, channel, height, width = hidden_states.shape
             hidden_states = hidden_states.view(batch_size, channel, height * width).transpose(1, 2)
+
+
+
+        if self.compress_kv_factor is not None:
+            batch_size = hidden_states.shape[0]
+            if len(last_shape) == 2:
+                encoder_hidden_states = hidden_states.permute(0, 2, 1).reshape(batch_size, self.dim, *last_shape)
+                encoder_hidden_states = attn.sr(encoder_hidden_states).reshape(batch_size, self.dim, -1).permute(0, 2, 1)
+            elif len(last_shape) == 1:
+                encoder_hidden_states = hidden_states.permute(0, 2, 1)
+                if last_shape[0] % 2 == 1:
+                    first_frame_pad = encoder_hidden_states[:, :, :1].repeat((1, 1, attn.kernel_size - 1))
+                    encoder_hidden_states = torch.concatenate((first_frame_pad, encoder_hidden_states), dim=2)
+                encoder_hidden_states = attn.sr(encoder_hidden_states).permute(0, 2, 1)
+            else:
+                raise NotImplementedError(f'NotImplementedError with last_shape {last_shape}')
+                
+            encoder_hidden_states = attn.norm(encoder_hidden_states)
 
         batch_size, sequence_length, _ = (
             hidden_states.shape if encoder_hidden_states is None else encoder_hidden_states.shape
@@ -820,6 +943,8 @@ class AttnProcessor2_0:
         elif attn.norm_cross:
             encoder_hidden_states = attn.norm_encoder_hidden_states(encoder_hidden_states)
 
+        
+
         key = attn.to_k(encoder_hidden_states, *args)
         value = attn.to_v(encoder_hidden_states, *args)
 
@@ -830,6 +955,21 @@ class AttnProcessor2_0:
 
         key = key.view(batch_size, -1, attn.heads, head_dim).transpose(1, 2)
         value = value.view(batch_size, -1, attn.heads, head_dim).transpose(1, 2)
+
+        if self.use_rope:
+            # require the shape of (batch_size x nheads x ntokens x dim)
+            if position_q.ndim == 3:
+                query = self.rope2d(query, position_q) 
+            elif position_q.ndim == 2:
+                query = self.rope1d(query, position_q) 
+            else:
+                raise NotImplementedError
+            if position_k.ndim == 3:
+                key = self.rope2d(key, position_k)
+            elif position_k.ndim == 2:
+                key = self.rope1d(key, position_k)
+            else:
+                raise NotImplementedError
 
         # the output of sdp = (batch, num_heads, seq_len, head_dim)
         # TODO: add support for attn.scale when we move to Torch 2.1
@@ -1024,6 +1164,9 @@ class BasicTransformerBlock_(nn.Module):
             positional_embeddings: Optional[str] = None,
             num_positional_embeddings: Optional[int] = None,
             attention_mode: str = "xformers",
+            use_rope: bool = False, 
+            rope_scaling: Optional[Dict] = None, 
+            compress_kv_factor: Optional[Tuple] = None, 
     ):
         super().__init__()
         self.only_cross_attention = only_cross_attention
@@ -1066,7 +1209,10 @@ class BasicTransformerBlock_(nn.Module):
             bias=attention_bias,
             cross_attention_dim=cross_attention_dim if only_cross_attention else None,
             upcast_attention=upcast_attention,
-            attention_mode=attention_mode
+            attention_mode=attention_mode, 
+            use_rope=use_rope, 
+            rope_scaling=rope_scaling, 
+            compress_kv_factor=compress_kv_factor, 
         )
 
         # # 2. Cross-Attn
@@ -1125,6 +1271,9 @@ class BasicTransformerBlock_(nn.Module):
             timestep: Optional[torch.LongTensor] = None,
             cross_attention_kwargs: Dict[str, Any] = None,
             class_labels: Optional[torch.LongTensor] = None,
+            position_q: Optional[torch.LongTensor] = None,
+            position_k: Optional[torch.LongTensor] = None,
+            frame: int = None, 
     ) -> torch.FloatTensor:
         # Notice that normalization is always applied before the real computation in the following blocks.
         # 0. Self-Attention
@@ -1162,6 +1311,9 @@ class BasicTransformerBlock_(nn.Module):
             norm_hidden_states,
             encoder_hidden_states=encoder_hidden_states if self.only_cross_attention else None,
             attention_mask=attention_mask,
+            position_q=position_q,
+            position_k=position_k, 
+            last_shape=frame, 
             **cross_attention_kwargs,
         )
         if self.use_ada_layer_norm_zero:
@@ -1299,7 +1451,10 @@ class BasicTransformerBlock(nn.Module):
         attention_type: str = "default",
         positional_embeddings: Optional[str] = None,
         num_positional_embeddings: Optional[int] = None,
-        attention_mode: str = "xformers"
+        attention_mode: str = "xformers", 
+        use_rope: bool = False,
+        rope_scaling: Optional[Dict] = None,
+        compress_kv_factor: Optional[Tuple] = None, 
     ):
         super().__init__()
         self.only_cross_attention = only_cross_attention
@@ -1342,7 +1497,10 @@ class BasicTransformerBlock(nn.Module):
             bias=attention_bias,
             cross_attention_dim=cross_attention_dim if only_cross_attention else None,
             upcast_attention=upcast_attention,
-            attention_mode=attention_mode
+            attention_mode=attention_mode, 
+            use_rope=use_rope, 
+            rope_scaling=rope_scaling, 
+            compress_kv_factor=compress_kv_factor, 
         )
 
         # 2. Cross-Attn
@@ -1363,7 +1521,9 @@ class BasicTransformerBlock(nn.Module):
                 dropout=dropout,
                 bias=attention_bias,
                 upcast_attention=upcast_attention,
-                attention_mode='xformers',  # only xformers support attention_mask
+                attention_mode=attention_mode,  # only xformers support attention_mask
+                use_rope=False,  # do not position in cross attention
+                compress_kv_factor=None, 
             )  # is self-attn if encoder_hidden_states is none
         else:
             self.norm2 = None
@@ -1406,6 +1566,9 @@ class BasicTransformerBlock(nn.Module):
         timestep: Optional[torch.LongTensor] = None,
         cross_attention_kwargs: Dict[str, Any] = None,
         class_labels: Optional[torch.LongTensor] = None,
+        position_q: Optional[torch.LongTensor] = None,
+        position_k: Optional[torch.LongTensor] = None,
+        hw: Tuple[int, int] = None, 
     ) -> torch.FloatTensor:
         # Notice that normalization is always applied before the real computation in the following blocks.
         # 0. Self-Attention
@@ -1443,6 +1606,9 @@ class BasicTransformerBlock(nn.Module):
             norm_hidden_states,
             encoder_hidden_states=encoder_hidden_states if self.only_cross_attention else None,
             attention_mask=attention_mask,
+            position_q=position_q,
+            position_k=position_k,
+            last_shape=hw, 
             **cross_attention_kwargs,
         )
         if self.use_ada_layer_norm_zero:
@@ -1478,6 +1644,9 @@ class BasicTransformerBlock(nn.Module):
                 norm_hidden_states,
                 encoder_hidden_states=encoder_hidden_states,
                 attention_mask=encoder_attention_mask,
+                position_q=None,  # cross attn do not need relative position
+                position_k=None,
+                last_shape=None, 
                 **cross_attention_kwargs,
             )
             hidden_states = attn_output + hidden_states
@@ -1526,7 +1695,7 @@ class AdaLayerNormSingle(nn.Module):
     def __init__(self, embedding_dim: int, use_additional_conditions: bool = False):
         super().__init__()
 
-        self.emb = PixArtAlphaCombinedTimestepSizeEmbeddings (
+        self.emb = CombinedTimestepSizeEmbeddings(
             embedding_dim, size_emb_dim=embedding_dim // 3, use_additional_conditions=use_additional_conditions
         )
 

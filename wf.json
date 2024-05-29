@@ -1,149 +1,7 @@
 {
-  "last_node_id": 13,
-  "last_link_id": 14,
+  "last_node_id": 15,
+  "last_link_id": 17,
   "nodes": [
-    {
-      "id": 8,
-      "type": "OpenSoraPlanDecode",
-      "pos": [
-        1195,
-        291
-      ],
-      "size": {
-        "0": 210,
-        "1": 46
-      },
-      "flags": {},
-      "order": 2,
-      "mode": 0,
-      "inputs": [
-        {
-          "name": "model",
-          "type": "OpenSoraPlanModel",
-          "link": 8
-        },
-        {
-          "name": "samples",
-          "type": "LATENT",
-          "link": 7
-        }
-      ],
-      "outputs": [
-        {
-          "name": "image",
-          "type": "IMAGE",
-          "links": [
-            9
-          ],
-          "shape": 3,
-          "slot_index": 0
-        }
-      ],
-      "properties": {
-        "Node name for S&R": "OpenSoraPlanDecode"
-      }
-    },
-    {
-      "id": 4,
-      "type": "OpenSoraPlanLoader",
-      "pos": [
-        279,
-        303
-      ],
-      "size": {
-        "0": 315,
-        "1": 154
-      },
-      "flags": {},
-      "order": 0,
-      "mode": 0,
-      "outputs": [
-        {
-          "name": "OpenSoraPlanModel",
-          "type": "OpenSoraPlanModel",
-          "links": [
-            6,
-            8
-          ],
-          "shape": 3,
-          "slot_index": 0
-        }
-      ],
-      "properties": {
-        "Node name for S&R": "OpenSoraPlanLoader"
-      },
-      "widgets_values": [
-        "LanguageBind/Open-Sora-Plan-v1.0.0",
-        "CausalVAEModel_4x8x8",
-        "DeepFloyd/t5-v1_1-xxl",
-        "65x512x512",
-        false
-      ]
-    },
-    {
-      "id": 6,
-      "type": "VHS_VideoCombine",
-      "pos": [
-        1446,
-        115
-      ],
-      "size": [
-        315,
-        599
-      ],
-      "flags": {},
-      "order": 3,
-      "mode": 0,
-      "inputs": [
-        {
-          "name": "images",
-          "type": "IMAGE",
-          "link": 9
-        },
-        {
-          "name": "audio",
-          "type": "VHS_AUDIO",
-          "link": null
-        },
-        {
-          "name": "batch_manager",
-          "type": "VHS_BatchManager",
-          "link": null
-        }
-      ],
-      "outputs": [
-        {
-          "name": "Filenames",
-          "type": "VHS_FILENAMES",
-          "links": null,
-          "shape": 3
-        }
-      ],
-      "properties": {
-        "Node name for S&R": "VHS_VideoCombine"
-      },
-      "widgets_values": {
-        "frame_rate": 25,
-        "loop_count": 0,
-        "filename_prefix": "AnimateDiff",
-        "format": "video/h264-mp4",
-        "pix_fmt": "yuv420p",
-        "crf": 19,
-        "save_metadata": true,
-        "pingpong": false,
-        "save_output": true,
-        "videopreview": {
-          "hidden": false,
-          "paused": false,
-          "params": {
-            "filename": "AnimateDiff_00007.mp4",
-            "subfolder": "",
-            "type": "output",
-            "format": "video/h264-mp4"
-          }
-        }
-      }
-    },
     {
       "id": 7,
       "type": "OpenSoraPlanSample",
@@ -182,11 +40,145 @@
       "widgets_values": [
         "In this video, we are about to immerse you in a world brimming with vitality and freedom. As the camera gently sweeps across the scene, a young girl comes into view. She stands under the expansive blue sky, surrounded by clouds as white and fluffy as cotton. The sun is warm and bright, casting a joyful radiance on her face, reflecting the happiness within.  To the ebb and flow of the music, the girl begins to sway gently with the rhythm. Each movement she makes is as fluid as poetry, as if she is conversing with the clouds above. She twirls, she leaps, with every step seeming so effortless, so full of life. Join us as we capture the essence of joy and freedom, embodied in the dance of a girl under the blue sky and white clouds.",
         50,
-        10,
+        7.5,
         1462,
         "fixed",
         false
       ]
+    },
+    {
+      "id": 4,
+      "type": "OpenSoraPlanLoader",
+      "pos": [
+        279,
+        303
+      ],
+      "size": {
+        "0": 315,
+        "1": 154
+      },
+      "flags": {},
+      "order": 0,
+      "mode": 0,
+      "outputs": [
+        {
+          "name": "OpenSoraPlanModel",
+          "type": "OpenSoraPlanModel",
+          "links": [
+            6,
+            16
+          ],
+          "shape": 3,
+          "slot_index": 0
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "OpenSoraPlanLoader"
+      },
+      "widgets_values": [
+        "/home/admin/Open-Sora-Plan/LanguageBind/Open-Sora-Plan-v1.1.0",
+        "CausalVAEModel_4x8x8",
+        "/home/admin/Open-Sora-Plan/DeepFloyd/t5-v1_1-xxl",
+        "221x512x512",
+        false
+      ]
+    },
+    {
+      "id": 8,
+      "type": "OpenSoraPlanDecode",
+      "pos": [
+        1195,
+        291
+      ],
+      "size": {
+        "0": 210,
+        "1": 46
+      },
+      "flags": {},
+      "order": 2,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "model",
+          "type": "OpenSoraPlanModel",
+          "link": 16
+        },
+        {
+          "name": "samples",
+          "type": "LATENT",
+          "link": 7
+        }
+      ],
+      "outputs": [
+        {
+          "name": "image",
+          "type": "IMAGE",
+          "links": [
+            17
+          ],
+          "shape": 3,
+          "slot_index": 0
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "OpenSoraPlanDecode"
+      }
+    },
+    {
+      "id": 15,
+      "type": "VHS_VideoCombine",
+      "pos": [
+        1498,
+        304
+      ],
+      "size": {
+        "0": 315,
+        "1": 218
+      },
+      "flags": {},
+      "order": 3,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "images",
+          "type": "IMAGE",
+          "link": 17
+        },
+        {
+          "name": "audio",
+          "type": "VHS_AUDIO",
+          "link": null
+        },
+        {
+          "name": "meta_batch",
+          "type": "VHS_BatchManager",
+          "link": null
+        }
+      ],
+      "outputs": [
+        {
+          "name": "Filenames",
+          "type": "VHS_FILENAMES",
+          "links": null,
+          "shape": 3
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "VHS_VideoCombine"
+      },
+      "widgets_values": {
+        "frame_rate": 8,
+        "loop_count": 0,
+        "filename_prefix": "AnimateDiff",
+        "format": "image/gif",
+        "pingpong": false,
+        "save_output": true,
+        "videopreview": {
+          "hidden": false,
+          "paused": false,
+          "params": {}
+        }
+      }
     }
   ],
   "links": [
@@ -207,7 +199,7 @@
       "LATENT"
     ],
     [
-      8,
+      16,
       4,
       0,
       8,
@@ -215,16 +207,24 @@
       "OpenSoraPlanModel"
     ],
     [
-      9,
+      17,
       8,
       0,
-      6,
+      15,
       0,
       "IMAGE"
     ]
   ],
   "groups": [],
   "config": {},
-  "extra": {},
+  "extra": {
+    "ds": {
+      "scale": 0.9090909090909091,
+      "offset": {
+        "0": -562.3823458862306,
+        "1": -130.40192138671875
+      }
+    }
+  },
   "version": 0.4
 }
